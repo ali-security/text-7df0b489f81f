@@ -1,0 +1,142 @@
+name: seal-build
+
+# golang.org/x/text ships no GitHub Actions CI of its own (upstream tests run on
+# the Go project's own TryBot infrastructure), so this workflow is authored for
+# the sealed build. It packs the module zip exactly as the module proxy does and
+# runs the repository's real suite -- `go build ./...` and `go test ./...` -- on
+# every OS this package must cover.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package/test selector to narrow the suite; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MODULE_PATH: golang.org/x/text
+  MODULE_VERSION: v0.25.0
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Build the module-zip helper outside the checkout
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" create_mod.go
+
+      - name: Pack the module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          # The packed tree must be the module as published: this workflow and
+          # its helper are seal-build scaffolding and upstream ships no .github
+          # directory at all, so remove it before packing.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            "$MODULE_PATH" \
+            "$MODULE_VERSION" \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | tail -n 5
+
+      - name: Upload the module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.25.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      - name: Test
+        run: |
+          # The suite runs with -v into a file (tens of thousands of lines), and
+          # the log gets: one ok/FAIL line per package, the passed/failed/skipped
+          # test counts, and every skipped test with the t.Skip message that
+          # preceded it. A skip with no message is t.SkipNow -- in x/text that is
+          # feature/plural's chkError, which skips the remaining subtest steps
+          # only after it has asserted the expected compile error. On failure
+          # the full verbose output is printed and the step fails.
+          LOG="$RUNNER_TEMP/go-test.log"
+          if go test -v ${{ inputs.test-filter || './...' }} > "$LOG" 2>&1; then rc=0; else rc=$?; fi
+          echo "===== go test results per package ====="
+          awk '
+            /^=== (RUN|PAUSE|CONT|NAME)/ { buf = ""; next }
+            /^[ \t]*--- (PASS|FAIL|SKIP):/ {
+              if ($2 == "PASS:") p++
+              else if ($2 == "FAIL:") f++
+              else {
+                s++
+                r = (buf == "") ? "(no message: t.SkipNow after an asserted expected error)" : buf
+                pend[++np] = $3 "\t" r
+              }
+              buf = ""; next
+            }
+            /^(ok|FAIL|\?)[ \t]/ {
+              print
+              for (i = 1; i <= np; i++) skips[++ns] = $2 "\t" pend[i]
+              np = 0; next
+            }
+            { t = $0; sub(/^[ \t]+/, "", t); if (t != "" && t != "PASS" && t != "FAIL") buf = t }
+            END {
+              printf "===== go test summary =====\ntests passed: %d\ntests failed: %d\ntests skipped: %d\n", p, f, s
+              print "===== skipped tests (package, test, reason) ====="
+              for (i = 1; i <= ns; i++) print "SKIP\t" skips[i]
+            }' "$LOG"
+          if [ "$rc" -ne 0 ]; then
+            echo "go test exited $rc; full verbose output follows"
+            cat "$LOG"
+            exit "$rc"
+          fi
+
+      - name: Test unicode/norm against the Unicode conformance data (-long)
+        # testtext.SkipIfNotLong guards the NormalizationTest.txt conformance
+        # tests behind -long because they fetch UCD data from unicode.org; run
+        # them for unicode/norm, the package the pending CVE fix touches.
+        if: ${{ inputs.test-filter == '' }}
+        run: go test -v ./unicode/norm/ -long
